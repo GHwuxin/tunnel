@@ -40,7 +40,9 @@ public class TableNameFilter implements IEventFilter {
         if (event == null || event.getTable() == null) {
             return false;
         }
-        Matcher matcher = pattern.matcher(event.getTable());
+        // 删除PG中的转义符'\"'
+        String tableName = event.getTable().replace("\"", "");
+        Matcher matcher = pattern.matcher(tableName);
         return matcher.matches();
     }
 

@@ -17,22 +17,35 @@
 package com.hellobike.base.tunnel.publisher.es;
 
 import com.alibaba.druid.pool.DruidDataSource;
+import com.alibaba.fastjson.JSON;
 import com.hellobike.base.tunnel.config.EsConfig;
 import com.hellobike.base.tunnel.model.ColumnData;
 import com.hellobike.base.tunnel.model.Event;
 import com.hellobike.base.tunnel.model.EventType;
 import com.hellobike.base.tunnel.model.InvokeContext;
+import com.hellobike.base.tunnel.model.Point;
+import com.hellobike.base.tunnel.model.Shape;
 import com.hellobike.base.tunnel.monitor.TunnelMonitorFactory;
 import com.hellobike.base.tunnel.publisher.BasePublisher;
 import com.hellobike.base.tunnel.publisher.IPublisher;
 import com.hellobike.base.tunnel.spi.api.CollectionUtils;
 import com.hellobike.base.tunnel.utils.NamedThreadFactory;
+import com.vividsolutions.jts.geom.Geometry;
+import com.vividsolutions.jts.io.ParseException;
+import com.vividsolutions.jts.io.WKBReader;
+
+import java.io.IOException;
+import java.io.StringWriter;
+import java.util.Map.Entry;
+
 import org.apache.commons.dbutils.QueryRunner;
 import org.apache.commons.dbutils.handlers.MapHandler;
 import org.apache.commons.dbutils.handlers.MapListHandler;
 import org.apache.commons.lang3.StringUtils;
+import org.apache.hadoop.hbase.util.Bytes;
 import org.apache.http.HttpHost;
 import org.elasticsearch.action.DocWriteRequest;
+import org.elasticsearch.action.bulk.BulkItemResponse;
 import org.elasticsearch.action.bulk.BulkRequest;
 import org.elasticsearch.action.bulk.BulkResponse;
 import org.elasticsearch.action.delete.DeleteRequest;
@@ -42,6 +55,7 @@ import org.elasticsearch.action.update.UpdateRequest;
 import org.elasticsearch.client.RequestOptions;
 import org.elasticsearch.client.RestClient;
 import org.elasticsearch.client.RestHighLevelClient;
+import org.geotools.geojson.geom.GeometryJSON;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -150,14 +164,44 @@ public class EsPublisher extends BasePublisher implements IPublisher {
 
     }
 
-    private DocWriteRequest eventToRequest(EsConfig esConfig, EventType eventType, Map<String, String> values) {
+    private static void insert(Map<String, Object> values, String key, Object value) {
+        if (StringUtils.isEmpty(key)) {
+            return;
+        }
+        String[] keys = key.split("\\.");
+        if (keys.length == 0) {
+            return;
+        }
+        Map<String, Object> r = values;
+        for (int i = 0; i < keys.length - 1; i++) {
+            Object obj = r.get(keys[i]);
+            if (obj == null) {
+                Map<String, Object> objInner = new HashMap<>();
+                r.put(keys[i], objInner);
+                r = objInner;
+            } else {
+                r = (Map<String, Object>) obj;
+            }
+        }
+        r.put(keys[keys.length - 1], value);
+    }
 
+    public static Map<String, Object> toStructDoc(Map<String, Object> values) {
+        Map<String, Object> result = new HashMap<>();
+        for (Entry<String, Object> entry : values.entrySet()) {
+            insert(result, entry.getKey(), entry.getValue());
+        }
+        return result;
+    }
+
+    private DocWriteRequest eventToRequest(EsConfig esConfig, EventType eventType, Map<String, ?> values) {
         DocWriteRequest req = null;
-
+        Map<String, Object> valuesCopy = new HashMap<>();
+        values.entrySet().stream().forEach(entry -> valuesCopy.put(entry.getKey(), entry.getValue()));
         // column_name,column_name
         String id = esConfig.getEsIdFieldNames()
                 .stream()
-                .map(esId -> String.valueOf(values.get(esId)))
+                .map(esId -> String.valueOf(valuesCopy.get(esId)))
                 .reduce((s1, s2) -> s1 + esConfig.getSeparator() + s2)
                 .orElse("");
 
@@ -167,12 +211,11 @@ public class EsPublisher extends BasePublisher implements IPublisher {
         String type = esConfig.getType();
         String index = esConfig.getIndex();
 
-
         switch (eventType) {
             case INSERT:
             case UPDATE:
                 UpdateRequest ur = new UpdateRequest(index, type, id);
-                ur.doc(values);
+                ur.doc(toStructDoc(valuesCopy));
                 ur.docAsUpsert(true);
                 req = ur;
                 break;
@@ -227,9 +270,14 @@ public class EsPublisher extends BasePublisher implements IPublisher {
             try {
 
                 BulkResponse response = restClient.bulk(br, requestOptions);
-
                 long e = System.currentTimeMillis();
-                LOG.info("indexed doc:{},cost:{}ms,result:{}", doc.size(), e - s, response.hasFailures());
+                LOG.info("indexed doc:{},cost:{}ms,success:{}", doc.size(), e - s, !response.hasFailures());
+                for (BulkItemResponse item : response.getItems()) {
+                    if (item.isFailed()) {
+                        LOG.error("OP: {}, index: {}, failure reason: {}", item.getOpType(), item.getFailure().getIndex(), item.getFailureMessage());
+                    }
+                }
+
                 return;
             } catch (Exception e) {
                 //
@@ -337,14 +385,57 @@ public class EsPublisher extends BasePublisher implements IPublisher {
                     .collect(Collectors.toList());
         } else {
             return helpers.stream()
-                    .map(helper ->
-                            eventToRequest(
-                                    helper.esConfig,
-                                    helper.context.getEvent().getEventType(),
-                                    helper.context.getEvent().getDataList()
-                                            .stream()
-                                            .collect(Collectors.toMap(ColumnData::getName, ColumnData::getValue))
-                            )
+                    .map(helper -> {
+                                Map<String, Object> r = new HashMap<>();
+                                helper.context.getEvent().getDataList()
+                                        .stream()
+                                        .forEach(columnData -> {
+                                            if (StringUtils.isNotEmpty(columnData.getValue())) {
+                                                String columnName = columnData.getName().replace("\"", "");
+                                                if ("geo_shape".equals(esConfig.getFieldMappings().get(columnName))) {
+                                                    WKBReader reader = new WKBReader();
+                                                    Geometry geometry = null;
+                                                    try {
+                                                        geometry = reader
+                                                                .read(Bytes.fromHex(columnData.getValue()));
+                                                        StringWriter writer = new StringWriter();
+                                                        GeometryJSON g = new GeometryJSON(20);
+                                                        g.write(geometry, writer);
+                                                        Shape shape = JSON.parseObject(writer.toString(), Shape.class);
+                                                        Map<String, Object> map = new HashMap<>();
+                                                        map.put("type", shape.getType());
+                                                        map.put("coordinates", shape.getCoordinates());
+                                                        r.put(columnName, map);
+                                                    } catch (ParseException | IOException e) {
+                                                        e.printStackTrace();
+                                                    }
+                                                } else if ("geo_point".equals(esConfig.getFieldMappings().get(columnName))) {
+                                                    WKBReader reader = new WKBReader();
+                                                    Geometry geometry = null;
+                                                    try {
+                                                        geometry = reader
+                                                                .read(Bytes.fromHex(columnData.getValue()));
+                                                        StringWriter writer = new StringWriter();
+                                                        GeometryJSON g = new GeometryJSON(20);
+                                                        g.write(geometry, writer);
+                                                        Point point = JSON.parseObject(writer.toString(), Point.class);
+                                                        Map<String, Object> map = new HashMap<>();
+                                                        map.put("type", point.getType());
+                                                        map.put("coordinates", point.getCoordinates());
+                                                        r.put(columnName, map);
+                                                    } catch (ParseException | IOException e) {
+                                                        e.printStackTrace();
+                                                    }
+                                                } else {
+                                                    r.put(columnName, columnData.getValue());
+                                                }
+                                            }
+                                        });
+                                return eventToRequest(
+                                        helper.esConfig,
+                                        helper.context.getEvent().getEventType(), r
+                                );
+                            }
                     )
                     .filter(Objects::nonNull)
                     .collect(Collectors.toList());
@@ -372,8 +463,7 @@ public class EsPublisher extends BasePublisher implements IPublisher {
                     helper.context.getEvent().setSlotName(helper.context.getSlotName());
                     return helper.context.getEvent();
                 })
-                .collect(Collectors.groupingBy(event ->
-                        event.getSchema() + "@@" + event.getSlotName() + "@@" + event.getTable() + "@@es", Collectors.counting()));
+                .collect(Collectors.groupingBy(event -> event.getSchema() + "@@" + event.getSlotName() + "@@" + event.getTable() + "@@es", Collectors.counting()));
     }
 
     private Map<String, Object> executeQuery(String sql, InvokeContext context) {

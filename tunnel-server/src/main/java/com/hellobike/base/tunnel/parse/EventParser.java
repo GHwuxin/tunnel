@@ -128,7 +128,11 @@ public class EventParser implements IEventParser {
             return lexer.token();
         }
         lexer.nextToken(' ');
-        return lexer.token();
+        if ("null".equals(lexer.token)) {
+            return null;
+        } else {
+            return lexer.token();
+        }
     }
 
 
@@ -171,7 +175,7 @@ public class EventParser implements IEventParser {
                 int commaCount = 1;
                 StringBuilder out = new StringBuilder(16);
                 while (!((pos == length - 1 || (array[pos + 1] == ' ' && commaCount % 2 == 1)) && array[pos] == '\'')) {
-                    if(array[pos] == '\'') {
+                    if (array[pos] == '\'') {
                         commaCount++;
                     }
                     out.append(array[pos]);
