@@ -1,17 +1,16 @@
 tunnel_subscribe_config:
   pg_dump_path: ''
   subscribes:
-    - slotName: "slot_for_chdl_th03_02"
+    - slotName: "slot_for_es"
       pgConnConf:
-        host: localhost
+        host: 172.30.220.247
         port: 5432
-        database: metadata_db
-        user: postgres
-        password: 123456
+        database: dm_metadata
+        user: user_rep
+        password: postgres
       rules:
-        - { table: chdl_th03-01_raw, pks: [ id ], esid: [ id ], index: chdl_th03-01_raw, type: type }
-        - { table: chdl_th03-01_ggps_l0, pks: [ id ], esid: [ id ], index: chdl_th03-01_ggps_l0, type: type, fields: { meta.imageInfo.corners: "geo_shape", meta.imageInfo.centreLocation: "geo_shape" } }
+        - { table: meta_field, pks: [ id ], esid: [ id ], index: meta_field, type: logs }
       esConf:
         addrs:
-          - 172.16.1.81:9200
-tunnel_zookeeper_address: localhost:2181
+          - 172.30.220.247:9200
+tunnel_zookeeper_address: 172.30.220.247:2181
